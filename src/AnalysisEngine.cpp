@@ -156,6 +156,12 @@ std::vector<RiskItem> AnalysisEngine::classifyRisks(const std::vector<Issue>& is
                 item.level = RiskItem::Level::HIGH;
                 item.reason = "forbidden connection is present in the design";
                 break;
+
+            case Issue::Type::SYNTH_RISK:
+                item.level =
+                    (issue.severity == Issue::Severity::ERROR) ? RiskItem::Level::HIGH : RiskItem::Level::MEDIUM;
+                item.reason = "non-synthesizable / latch-prone construct (DC may infer a latch or memory)";
+                break;
         }
 
         result.push_back(std::move(item));

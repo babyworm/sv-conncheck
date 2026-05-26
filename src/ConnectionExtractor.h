@@ -70,6 +70,56 @@ private:
     // non-empty.
     void collectDBaseFromLeaf(std::string_view leaf);
 
+    // Synthesizability / latch-inference detection. Populated per module
+    // instance during the procedural-block walk and drained into
+    // graph_.synthRisks at the end of visitInstance (mirrors the _q/_d
+    // MissingDSuffix accounting). See ConnectionExtractor.cpp for the
+    // discriminator logic.
+    struct ArrayFact {
+        // A clocked (always_ff / always-with-clock) write to arr[var]
+        // that is nested under a data-dependent conditional -> only a
+        // subset of elements get a new value each cycle (partial write).
+        bool clockedVarIdxPartialWrite = false;
+        // A clocked write that drives the whole next-state (variable or
+        // loop index, but NOT under a data-dependent conditional, i.e.
+        // an unconditional default-hold/overwrite of every element, or a
+        // whole-array `arr <= ...`). Presence of this clears the latch
+        // risk because DC then sees a plain flop array.
+        bool clockedFullWrite = false;
+        // The array symbol is read in an always_comb / always @(*) or a
+        // continuous assign (any index).
+        bool combRead = false;
+        // First location of the offending partial write (for reporting).
+        slang::SourceLocation partialWriteLoc;
+        uint32_t partialWriteLine = 0;
+        uint32_t partialWriteCol = 0;
+    };
+    // keyed by array leaf name within the current module instance.
+    std::unordered_map<std::string, ArrayFact> arrayFacts_;
+
+    // Collect array element-select reads (NamedValue base of an
+    // ElementSelectExpression) from an expression subtree, marking the
+    // ArrayFact.combRead bit. Used for continuous-assign RHS.
+    void collectArrayCombReads(const slang::ast::Expression* expr);
+    // Walk a combinational block body, marking ArrayFact.combRead for
+    // every unpacked-array element-select read on assignment RHS sides.
+    void collectArrayCombReadsInStatement(const slang::ast::Statement& stmt);
+    // Walk a clocked (always_ff / always) block body, classifying writes
+    // to unpacked-array elements as partial (variable data-dependent
+    // index) or full (loop-induction-variable sweep / whole-array). The
+    // set of in-scope for-loop induction variables is threaded down so a
+    // `for(y) for(x) arr[y][x] <= ...` full next-state is told apart from
+    // `arr[data_signal] <= ...` partial write.
+    void scanClockedArrayWrites(const slang::ast::Statement& stmt,
+                                std::unordered_set<const slang::ast::Symbol*>& loopVars, bool inResetBranch);
+    // Fill line/column for a SynthRisk from its location (mirrors
+    // populateLineColumn for StyleObservation).
+    void populateLineColumn(SynthRisk& risk) const;
+    // Secondary rule: flag always_comb signals assigned only inside an
+    // incomplete branch structure (if-without-else / case-without-default)
+    // with no unconditional default -> latch-prone. Emits WARN SynthRisks.
+    void scanIncompleteCombAssignments(const slang::ast::ProceduralBlockSymbol& block, const std::string& scopePath);
+
     slang::ast::Compilation& compilation_;
     std::string topModule_;
     int maxDepth_;

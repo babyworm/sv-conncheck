@@ -21,6 +21,7 @@ struct ConnCliOptions {
     bool checkProtocol = false;
     bool checkConvention = false;
     bool checkClockReset = false;
+    bool checkSynth = false;
     std::string conventionFile;
     std::string expectFile;
     std::string diffFile;

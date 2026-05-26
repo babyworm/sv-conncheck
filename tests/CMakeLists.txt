@@ -3,6 +3,7 @@ add_executable(svlens-tests
     test_width_checker.cpp
     test_type_checker.cpp
     test_dangling_checker.cpp
+    test_synthesizability_checker.cpp
     test_undriven_checker.cpp
     test_protocol_checker.cpp
     test_convention_checker.cpp
@@ -69,6 +70,7 @@ target_link_libraries(svlens-tests PRIVATE svlens-conn-lib svlens-cdc-lib Catch2
 target_compile_definitions(svlens-tests PRIVATE
     TEST_SV_DIR="${CMAKE_CURRENT_SOURCE_DIR}/sv"
     TEST_CDC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/cdc/basic"
+    TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
     SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/test_waivers.yaml DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
 file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/waiver_integration.yaml DESTINATION ${CMAKE_CURRENT_BINARY_DIR})

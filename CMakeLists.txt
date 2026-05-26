@@ -156,6 +156,7 @@ add_library(svlens-conn-lib OBJECT
     src/DanglingChecker.cpp
     src/UndrivenChecker.cpp
     src/ProtocolChecker.cpp
+    src/SynthesizabilityChecker.cpp
     src/ConventionChecker.cpp
     src/CheckerRunner.cpp
     src/WaiverFilter.cpp

@@ -17,7 +17,8 @@ struct Issue {
         PROTOCOL_INCOMPLETE,
         CONVENTION,
         EXPECT_MISSING,
-        EXPECT_FORBIDDEN
+        EXPECT_FORBIDDEN,
+        SYNTH_RISK
     };
 
     enum class Severity {
@@ -47,6 +48,8 @@ struct Issue {
             case Type::CONVENTION:       return "CONVENTION";
             case Type::EXPECT_MISSING:   return "EXPECT_MISSING";
             case Type::EXPECT_FORBIDDEN: return "EXPECT_FORBIDDEN";
+            case Type::SYNTH_RISK:
+                return "SYNTH_RISK";
         }
         return "UNKNOWN";
     }

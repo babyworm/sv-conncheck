@@ -15,6 +15,7 @@
 #include "JsonReport.h"
 #include "MarkdownReport.h"
 #include "ProtocolChecker.h"
+#include "SynthesizabilityChecker.h"
 #include "TableReport.h"
 #include "TypeChecker.h"
 #include "UndrivenChecker.h"
@@ -55,6 +56,8 @@ std::vector<Issue> runConnCheckers(const ConnCliOptions& opts,
         runner.addChecker(std::make_unique<UndrivenChecker>());
     if (opts.checkProtocol)
         runner.addChecker(std::make_unique<ProtocolChecker>());
+    if (opts.checkSynth)
+        runner.addChecker(std::make_unique<SynthesizabilityChecker>());
     if (opts.checkConvention) {
         auto rules = opts.conventionFile.empty()
             ? ConventionRules{}

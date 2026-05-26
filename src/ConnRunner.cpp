@@ -14,7 +14,8 @@
 
 void connect::printConnUsage() {
     const std::string usage =
-        std::string("svlens conn v") + SVLENS_VERSION + " -- Module interconnect verification and analysis\n\n"
+        std::string("svlens conn v") + SVLENS_VERSION +
+        " -- Module interconnect verification and analysis\n\n"
         "Usage: svlens conn [OPTIONS] <SV_FILES...>\n\n"
         "Required:\n"
         "  --top <module>                 Top-level module\n"
@@ -24,13 +25,16 @@ void connect::printConnUsage() {
         "  --format <fmt>                 json|md|csv|table|dot|html|all (default: all)\n"
         "  --version                      Show version\n"
         "  --help                         Show this help message\n"
-        "  " + commoncli::passThroughNote() + "\n\n"
+        "  " +
+        commoncli::passThroughNote() +
+        "\n\n"
         "Analysis (all enabled by default, use --no-* to disable):\n"
         "  --no-check-width        Disable width mismatch checking\n"
         "  --no-check-type         Disable type mismatch checking\n"
         "  --no-check-dangling     Disable dangling output checking\n"
         "  --no-check-undriven     Disable undriven input checking\n"
         "  --check-protocol        Enable protocol completeness checking\n"
+        "  --check-synth           Enable synthesizability / latch-inference checking (ERROR-gating)\n"
         "  --check-convention      Enable naming convention checking\n"
         "  --check-clock-reset     Enable clock/reset topology analysis\n"
         "  --convention <file>     Custom convention rules (YAML, optional)\n"
@@ -65,7 +69,8 @@ void connect::printConnUsage() {
         "Notes:\n"
         "  Use docs/schema/connect_report.md for the stable JSON contract.\n"
         "  Use 'svlens help both' for combined-run output behavior.\n"
-        "  " + commoncli::productBoundaryNote() + "\n";
+        "  " +
+        commoncli::productBoundaryNote() + "\n";
     fmt::print("{}", usage);
 }
 
@@ -114,6 +119,8 @@ connect::ConnCliOptions connect::parseConnArgs(int argc, const char* const* argv
             opts.checkUndriven = false;
         } else if (arg == "--check-protocol") {
             opts.checkProtocol = true;
+        } else if (arg == "--check-synth") {
+            opts.checkSynth = true;
         } else if (arg == "--check-convention") {
             opts.checkConvention = true;
         } else if (arg == "--check-clock-reset") {

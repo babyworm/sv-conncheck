@@ -16,8 +16,11 @@
 #include <slang/ast/expressions/SelectExpressions.h>
 #include <slang/ast/Statement.h>
 #include <slang/ast/statements/ConditionalStatements.h>
+#include <slang/ast/statements/LoopStatements.h>
 #include <slang/ast/statements/MiscStatements.h>
 #include <slang/ast/types/Type.h>
+#include <slang/ast/TimingControl.h>
+#include <slang/ast/ASTVisitor.h>
 #include <slang/syntax/AllSyntax.h>
 #include <slang/parsing/TokenKind.h>
 #include <slang/text/SourceManager.h>
@@ -27,6 +30,7 @@
 #include <algorithm>
 #include <cctype>
 #include <functional>
+#include <span>
 
 namespace connect {
 
@@ -80,6 +84,88 @@ bool isConstantZero(const slang::ast::Expression* expr) {
     }
 
     return false;
+}
+
+// Peel a (possibly multi-dimensional) ElementSelect chain down to its
+// root NamedValue symbol. Reports the root array leaf name, whether ANY
+// selector along the chain is a non-constant (variable) index, and
+// whether the root symbol is an unpacked array (the storage shape DC
+// turns into a memory/latch). Returns false when the expression is not
+// rooted at a simple named unpacked-array element select.
+bool resolveArrayElementSelect(const slang::ast::Expression* expr, std::string& rootName, bool& hasNonConstIndex,
+                               std::vector<const slang::ast::Expression*>* nonConstSelectors = nullptr) {
+    using slang::ast::ExpressionKind;
+    hasNonConstIndex = false;
+    const slang::ast::Expression* cur = expr;
+    bool sawSelect = false;
+    // Unwrap conversions and walk down through nested element selects.
+    while (cur) {
+        if (cur->kind == ExpressionKind::Conversion) {
+            cur = &cur->as<slang::ast::ConversionExpression>().operand();
+            continue;
+        }
+        if (cur->kind == ExpressionKind::ElementSelect) {
+            auto& sel = cur->as<slang::ast::ElementSelectExpression>();
+            auto* constant = sel.selector().getConstant();
+            if (!(constant && *constant)) {
+                hasNonConstIndex = true;
+                if (nonConstSelectors)
+                    nonConstSelectors->push_back(&sel.selector());
+            }
+            sawSelect = true;
+            cur = &sel.value();
+            continue;
+        }
+        break;
+    }
+    if (!sawSelect || !cur || cur->kind != ExpressionKind::NamedValue)
+        return false;
+    auto& named = cur->as<slang::ast::NamedValueExpression>();
+    // Only unpacked arrays (register-file / memory storage) are at risk;
+    // a packed-vector bit/part select is ordinary combinational fanout.
+    if (!named.symbol.getType().isUnpackedArray())
+        return false;
+    rootName = std::string(named.symbol.name);
+    return true;
+}
+
+// True when every value reference inside the selector expression resolves
+// to one of the in-scope for-loop induction variables (so a sweep over
+// these indices touches every array element). A selector that references
+// any other signal (a register/port like `diag` / `i_waddr`) is a
+// data-dependent partial address -> not loop-var-only.
+bool selectorUsesOnlyLoopVars(const slang::ast::Expression& sel,
+                              const std::unordered_set<const slang::ast::Symbol*>& loopVars) {
+    bool onlyLoopVars = true;
+    auto visitor = slang::ast::makeVisitor([&](auto& self, const slang::ast::NamedValueExpression& nv) {
+        if (loopVars.find(&nv.symbol) == loopVars.end())
+            onlyLoopVars = false;
+        self.visitDefault(nv);
+    });
+    sel.visit(visitor);
+    return onlyLoopVars;
+}
+
+// True when a conditional's controlling expression references a
+// reset-named signal (rst / rst_n / *_rst* / reset variants). Used to
+// skip the async-reset clear branch of a clocked block: writes there are
+// the reset preset, not the functional next-state, so they neither
+// establish nor clear the latch-inference verdict.
+bool conditionReferencesReset(std::span<const slang::ast::ConditionalStatement::Condition> conds) {
+    auto looksLikeReset = [](const std::string& s) {
+        return s == "rst" || s.starts_with("rst_") || s.ends_with("_rst") || s.find("_rst_") != std::string::npos ||
+               s == "reset" || s.starts_with("reset_") || s.ends_with("_reset") ||
+               s.find("_reset_") != std::string::npos;
+    };
+    bool found = false;
+    auto visitor = slang::ast::makeVisitor([&](auto& self, const slang::ast::NamedValueExpression& nv) {
+        if (looksLikeReset(std::string(nv.symbol.name)))
+            found = true;
+        self.visitDefault(nv);
+    });
+    for (const auto& c : conds)
+        c.expr->visit(visitor);
+    return found;
 }
 
 slang::ast::ArgumentDirection inferInterfaceDirection(const slang::ast::PortConnection& conn) {
@@ -371,11 +457,40 @@ void ConnectionExtractor::visitInstance(const slang::ast::InstanceSymbol& instan
     auto saved_q = std::move(registered_q_bases_);
     auto saved_d = std::move(combinational_d_bases_);
     bool saved_comb = has_comb_context_;
+    auto saved_arrayFacts = std::move(arrayFacts_);
     registered_q_bases_.clear();
     combinational_d_bases_.clear();
     has_comb_context_ = false;
+    arrayFacts_.clear();
 
     visitScope(instance.body, parentPath);
+
+    // Synthesizability latch-inference verdict (primary rule). Flag an
+    // unpacked array that is (a) variable-index partial-written in a
+    // clocked block, (b) NOT given a full next-state in that block, and
+    // (c) read combinationally -> DC infers a latch/memory (ELAB-978).
+    // The full-write discriminator keeps a proper RAM (registered read,
+    // no comb read) and an explicit default-hold+overwrite register file
+    // clean.
+    for (const auto& [arrName, fact] : arrayFacts_) {
+        if (fact.clockedVarIdxPartialWrite && fact.combRead && !fact.clockedFullWrite) {
+            SynthRisk risk;
+            risk.kind = SynthRisk::Kind::RegfileLatchInference;
+            risk.scopePath = parentPath;
+            risk.signal = arrName;
+            risk.isError = true;
+            risk.location = fact.partialWriteLoc;
+            risk.lineNumber = fact.partialWriteLine;
+            risk.columnNumber = fact.partialWriteCol;
+            if (!risk.location.valid())
+                populateLineColumn(risk);
+            risk.detail = fmt::format("array '{}' is variable-index partial-written in a clocked block and read "
+                                      "combinationally -> DC infers a latch/memory (ELAB-978); drive the full "
+                                      "next-state explicitly (default-hold + overwrite) or use a proper RAM macro.",
+                                      arrName);
+            graph_.synthRisks.push_back(std::move(risk));
+        }
+    }
 
     // Emit one INFO per _q base that has no matching _d driver.
     // Conservative skip: only emit when the module has at least one
@@ -404,6 +519,7 @@ void ConnectionExtractor::visitInstance(const slang::ast::InstanceSymbol& instan
     registered_q_bases_ = std::move(saved_q);
     combinational_d_bases_ = std::move(saved_d);
     has_comb_context_ = saved_comb;
+    arrayFacts_ = std::move(saved_arrayFacts);
 }
 
 void ConnectionExtractor::visitScope(const slang::ast::Scope& scope,
@@ -735,6 +851,10 @@ void ConnectionExtractor::processContinuousAssign(const slang::ast::ContinuousAs
     // Round 39 US-39B: any continuous assign means this module has
     // combinational logic context -- set flag before early returns.
     has_comb_context_ = true;
+    // Synthesizability: a continuous assign is combinational; mark any
+    // unpacked-array element-select read on its RHS (run before the
+    // element-select early-return below).
+    collectArrayCombReads(&assign.right());
     auto lhs = resolveExpr(&assign.left());
     auto rhs = resolveExpr(&assign.right());
     if (lhs.approximate || rhs.approximate ||
@@ -768,6 +888,54 @@ void ConnectionExtractor::processProceduralBlock(const slang::ast::ProceduralBlo
         block.procedureKind != slang::ast::ProceduralBlockKind::AlwaysFF) {
         return;
     }
+
+    // Synthesizability latch-inference scan. Classify this block as
+    // clocked (always_ff, or a legacy `always` whose timing has an
+    // edge), combinational (always_comb / always @(*) / always @(a or
+    // b)), or neither. Clocked blocks contribute array-write facts;
+    // combinational blocks contribute array-read facts. The verdict is
+    // computed per array symbol at the end of visitInstance.
+    {
+        using slang::ast::ProceduralBlockKind;
+        using slang::ast::TimingControlKind;
+        bool isClocked = block.procedureKind == ProceduralBlockKind::AlwaysFF;
+        bool isComb = block.procedureKind == ProceduralBlockKind::AlwaysComb;
+        if (block.procedureKind == ProceduralBlockKind::Always) {
+            // Inspect the wrapping timing control to tell a clocked
+            // `always @(posedge clk)` from a combinational `always @(*)`.
+            const slang::ast::Statement* body = &block.getBody();
+            while (body && body->kind == slang::ast::StatementKind::Block)
+                body = &body->as<slang::ast::BlockStatement>().body;
+            if (body && body->kind == slang::ast::StatementKind::Timed) {
+                const auto& tc = body->as<slang::ast::TimedStatement>().timing;
+                auto hasEdge = [](const slang::ast::TimingControl& t) {
+                    if (t.kind == TimingControlKind::SignalEvent)
+                        return t.as<slang::ast::SignalEventControl>().edge != slang::ast::EdgeKind::None;
+                    if (t.kind == TimingControlKind::EventList) {
+                        for (const auto* e : t.as<slang::ast::EventListControl>().events) {
+                            if (e && e->kind == TimingControlKind::SignalEvent &&
+                                e->as<slang::ast::SignalEventControl>().edge != slang::ast::EdgeKind::None)
+                                return true;
+                        }
+                    }
+                    return false;
+                };
+                if (hasEdge(tc))
+                    isClocked = true;
+                else
+                    isComb = true; // level-sensitive list / @(*) -> combinational
+            }
+        }
+        if (isClocked) {
+            std::unordered_set<const slang::ast::Symbol*> loopVars;
+            scanClockedArrayWrites(block.getBody(), loopVars, /*inResetBranch=*/false);
+        } else if (isComb) {
+            // Mark array element-select reads on assignment RHS sides
+            // throughout the combinational body.
+            collectArrayCombReadsInStatement(block.getBody());
+        }
+    }
+
     // Round 38 US-38A: lowRISC requires `always_ff` for sequential
     // and `always_comb` for combinational; the legacy `always @*` /
     // `always @(posedge clk)` form is discouraged because synthesis
@@ -1118,9 +1286,126 @@ void ConnectionExtractor::processProceduralBlock(const slang::ast::ProceduralBlo
                 }
             };
         walk_comb(block.getBody());
+
+        scanIncompleteCombAssignments(block, scopePath);
     }
 
     processProceduralStatement(block.getBody(), scopePath);
+}
+
+void ConnectionExtractor::scanIncompleteCombAssignments(const slang::ast::ProceduralBlockSymbol& block,
+                                                        const std::string& scopePath) {
+    using SK = slang::ast::StatementKind;
+    // Secondary rule: in always_comb, a simple signal assigned only inside
+    // an incomplete branch structure (an `if` with no `else`, or a `case`
+    // with no `default`) and never given an unconditional default value
+    // holds its previous value when no branch is taken -> the synthesizer
+    // infers a latch. We track three sets and flag the conservative
+    // intersection so the common default-then-override idiom (a signal
+    // assigned unconditionally first, then overridden in a branch) stays
+    // clean. WARN severity (non-fatal).
+    std::unordered_set<std::string> assignedUnconditional;   // covered by a default
+    std::unordered_set<std::string> assignedUnderIncomplete; // under if-no-else / case-no-default
+    std::unordered_set<std::string> assignedInElseOrDefault; // in a covering branch
+    std::unordered_map<std::string, slang::SourceLocation> firstIncompleteLoc;
+
+    auto leafOf = [&](const slang::ast::Expression& lhs) -> std::string {
+        auto resolved = resolveExpr(&lhs);
+        if (resolved.netNames.empty())
+            return {};
+        std::string name = resolved.netNames.front();
+        // Skip hierarchical / member writes and bit/element selects: only
+        // whole simple-signal assignments participate in the latch rule.
+        if (name.find('.') != std::string::npos || name.find('[') != std::string::npos)
+            return {};
+        return name;
+    };
+
+    // depth flags: underAnyConditional (inside any if/case), underIncomplete
+    // (inside an if-without-else or case-without-default branch).
+    std::function<void(const slang::ast::Statement&, bool, bool, bool)> walk =
+        [&](const slang::ast::Statement& s, bool underAnyCond, bool underIncomplete, bool underElseOrDefault) {
+            switch (s.kind) {
+            case SK::ExpressionStatement: {
+                auto& es = s.as<slang::ast::ExpressionStatement>();
+                if (es.expr.kind != slang::ast::ExpressionKind::Assignment)
+                    return;
+                auto& a = es.expr.as<slang::ast::AssignmentExpression>();
+                if (a.isNonBlocking())
+                    return;
+                std::string leaf = leafOf(a.left());
+                if (leaf.empty())
+                    return;
+                if (!underAnyCond)
+                    assignedUnconditional.insert(leaf);
+                if (underIncomplete) {
+                    assignedUnderIncomplete.insert(leaf);
+                    firstIncompleteLoc.emplace(leaf, a.left().sourceRange.start());
+                }
+                if (underElseOrDefault)
+                    assignedInElseOrDefault.insert(leaf);
+                return;
+            }
+            case SK::Block:
+                walk(s.as<slang::ast::BlockStatement>().body, underAnyCond, underIncomplete, underElseOrDefault);
+                return;
+            case SK::List:
+                for (auto* c : s.as<slang::ast::StatementList>().list)
+                    if (c)
+                        walk(*c, underAnyCond, underIncomplete, underElseOrDefault);
+                return;
+            case SK::Timed:
+                walk(s.as<slang::ast::TimedStatement>().stmt, underAnyCond, underIncomplete, underElseOrDefault);
+                return;
+            case SK::Conditional: {
+                auto& c = s.as<slang::ast::ConditionalStatement>();
+                bool hasElse = c.ifFalse != nullptr;
+                // The if-true branch is "incomplete" when there is no
+                // else; the else branch (if present) is a covering path.
+                walk(c.ifTrue, true, underIncomplete || !hasElse, underElseOrDefault);
+                if (c.ifFalse)
+                    walk(*c.ifFalse, true, underIncomplete, /*underElseOrDefault=*/true);
+                return;
+            }
+            case SK::Case: {
+                auto& cs = s.as<slang::ast::CaseStatement>();
+                bool hasDefault = cs.defaultCase != nullptr;
+                for (const auto& g : cs.items)
+                    if (g.stmt)
+                        walk(*g.stmt, true, underIncomplete || !hasDefault, underElseOrDefault);
+                if (cs.defaultCase)
+                    walk(*cs.defaultCase, true, underIncomplete, /*underElseOrDefault=*/true);
+                return;
+            }
+            default:
+                return;
+            }
+        };
+    walk(block.getBody(), false, false, false);
+
+    for (const auto& leaf : assignedUnderIncomplete) {
+        // Conservative: only flag when there is no unconditional default
+        // and no assignment in any covering else/default branch. This
+        // keeps default-then-override and fully-branched if/else clean.
+        if (assignedUnconditional.count(leaf) || assignedInElseOrDefault.count(leaf))
+            continue;
+        SynthRisk risk;
+        risk.kind = SynthRisk::Kind::IncompleteCombAssignment;
+        risk.scopePath = scopePath;
+        risk.signal = leaf;
+        risk.isError = false; // WARN (non-fatal)
+        auto it = firstIncompleteLoc.find(leaf);
+        if (it != firstIncompleteLoc.end())
+            risk.location = it->second;
+        else
+            risk.location = block.location;
+        populateLineColumn(risk);
+        risk.detail =
+            fmt::format("signal '{}' is assigned in some but not all branches of an always_comb "
+                        "if/case with no else/default and then read -> incomplete assignment may infer a latch.",
+                        leaf);
+        graph_.synthRisks.push_back(std::move(risk));
+    }
 }
 
 void ConnectionExtractor::processProceduralStatement(const slang::ast::Statement& stmt,
@@ -1301,6 +1586,191 @@ void ConnectionExtractor::collectDBaseFromLeaf(std::string_view leaf) {
     if (leaf.size() <= 2 || !leaf.ends_with("_d"))
         return;
     combinational_d_bases_.insert(std::string(leaf.substr(0, leaf.size() - 2)));
+}
+
+void ConnectionExtractor::populateLineColumn(SynthRisk& risk) const {
+    if (!risk.location.valid())
+        return;
+    const auto* sm = compilation_.getSourceManager();
+    if (!sm)
+        return;
+    risk.lineNumber = static_cast<uint32_t>(sm->getLineNumber(risk.location));
+    risk.columnNumber = static_cast<uint32_t>(sm->getColumnNumber(risk.location));
+}
+
+void ConnectionExtractor::collectArrayCombReads(const slang::ast::Expression* expr) {
+    if (!expr)
+        return;
+    // Any unpacked-array element-select read anywhere in this
+    // combinational expression marks the array as combinationally read.
+    // makeVisitor walks the full sub-expression tree so reads nested in
+    // operators, conversions, concatenations, etc. are all covered.
+    auto visitor = slang::ast::makeVisitor([&](auto& self, const slang::ast::ElementSelectExpression& sel) {
+        std::string rootName;
+        bool hasNonConstIndex = false;
+        if (resolveArrayElementSelect(&sel, rootName, hasNonConstIndex))
+            arrayFacts_[rootName].combRead = true;
+        self.visitDefault(sel);
+    });
+    expr->visit(visitor);
+}
+
+void ConnectionExtractor::collectArrayCombReadsInStatement(const slang::ast::Statement& stmt) {
+    using SK = slang::ast::StatementKind;
+    switch (stmt.kind) {
+    case SK::ExpressionStatement: {
+        auto& es = stmt.as<slang::ast::ExpressionStatement>();
+        if (es.expr.kind != slang::ast::ExpressionKind::Assignment)
+            return;
+        // Reads live on the RHS; LHS element-select indices are also
+        // read positions but for the latch rule only the RHS array
+        // fan-out matters.
+        collectArrayCombReads(&es.expr.as<slang::ast::AssignmentExpression>().right());
+        return;
+    }
+    case SK::Block:
+        collectArrayCombReadsInStatement(stmt.as<slang::ast::BlockStatement>().body);
+        return;
+    case SK::List:
+        for (auto* c : stmt.as<slang::ast::StatementList>().list)
+            if (c)
+                collectArrayCombReadsInStatement(*c);
+        return;
+    case SK::Conditional: {
+        auto& c = stmt.as<slang::ast::ConditionalStatement>();
+        collectArrayCombReadsInStatement(c.ifTrue);
+        if (c.ifFalse)
+            collectArrayCombReadsInStatement(*c.ifFalse);
+        return;
+    }
+    case SK::Case: {
+        auto& cs = stmt.as<slang::ast::CaseStatement>();
+        for (const auto& g : cs.items)
+            if (g.stmt)
+                collectArrayCombReadsInStatement(*g.stmt);
+        if (cs.defaultCase)
+            collectArrayCombReadsInStatement(*cs.defaultCase);
+        return;
+    }
+    case SK::Timed:
+        collectArrayCombReadsInStatement(stmt.as<slang::ast::TimedStatement>().stmt);
+        return;
+    case SK::ForLoop:
+        collectArrayCombReadsInStatement(stmt.as<slang::ast::ForLoopStatement>().body);
+        return;
+    default:
+        return;
+    }
+}
+
+void ConnectionExtractor::scanClockedArrayWrites(const slang::ast::Statement& stmt,
+                                                 std::unordered_set<const slang::ast::Symbol*>& loopVars,
+                                                 bool inResetBranch) {
+    using SK = slang::ast::StatementKind;
+    switch (stmt.kind) {
+    case SK::ExpressionStatement: {
+        // Writes inside the async-reset clear branch are the reset
+        // preset, not the functional next-state -> ignore entirely.
+        if (inResetBranch)
+            return;
+        auto& es = stmt.as<slang::ast::ExpressionStatement>();
+        if (es.expr.kind != slang::ast::ExpressionKind::Assignment)
+            return;
+        auto& a = es.expr.as<slang::ast::AssignmentExpression>();
+        std::string rootName;
+        bool hasNonConstIndex = false;
+        std::vector<const slang::ast::Expression*> nonConstSelectors;
+        if (resolveArrayElementSelect(&a.left(), rootName, hasNonConstIndex, &nonConstSelectors)) {
+            auto& fact = arrayFacts_[rootName];
+            if (!hasNonConstIndex) {
+                // Fully constant element write: a fixed single
+                // element, neither establishes nor clears the
+                // variable-address memory pattern.
+                return;
+            }
+            // A variable-index write whose every non-constant
+            // selector is composed solely of loop induction variables
+            // sweeps the whole declared extent -> full next-state.
+            // Any selector referencing a data signal (register/port)
+            // addresses a single data-dependent element -> partial.
+            bool allLoopVarOnly = true;
+            for (const auto* sel : nonConstSelectors) {
+                if (!selectorUsesOnlyLoopVars(*sel, loopVars)) {
+                    allLoopVarOnly = false;
+                    break;
+                }
+            }
+            if (allLoopVarOnly) {
+                fact.clockedFullWrite = true;
+            } else if (!fact.clockedVarIdxPartialWrite) {
+                fact.clockedVarIdxPartialWrite = true;
+                fact.partialWriteLoc = a.left().sourceRange.start();
+                const auto* sm = compilation_.getSourceManager();
+                if (sm && fact.partialWriteLoc.valid()) {
+                    fact.partialWriteLine = static_cast<uint32_t>(sm->getLineNumber(fact.partialWriteLoc));
+                    fact.partialWriteCol = static_cast<uint32_t>(sm->getColumnNumber(fact.partialWriteLoc));
+                }
+            }
+            return;
+        }
+        // Whole-array assignment `arr <= expr` (no element select):
+        // a full next-state, clears the latch risk.
+        if (a.left().kind == slang::ast::ExpressionKind::NamedValue) {
+            auto& named = a.left().as<slang::ast::NamedValueExpression>();
+            if (named.symbol.getType().isUnpackedArray())
+                arrayFacts_[std::string(named.symbol.name)].clockedFullWrite = true;
+        }
+        return;
+    }
+    case SK::Block:
+        scanClockedArrayWrites(stmt.as<slang::ast::BlockStatement>().body, loopVars, inResetBranch);
+        return;
+    case SK::List:
+        for (auto* c : stmt.as<slang::ast::StatementList>().list)
+            if (c)
+                scanClockedArrayWrites(*c, loopVars, inResetBranch);
+        return;
+    case SK::Conditional: {
+        auto& c = stmt.as<slang::ast::ConditionalStatement>();
+        // `if (!rst_n) <reset> else <normal>`: the true branch is the
+        // async-reset clear path. Mark it so its writes are ignored
+        // while the else branch carries the functional next-state.
+        bool resetCond = !inResetBranch && conditionReferencesReset(c.conditions);
+        scanClockedArrayWrites(c.ifTrue, loopVars, inResetBranch || resetCond);
+        if (c.ifFalse)
+            scanClockedArrayWrites(*c.ifFalse, loopVars, inResetBranch);
+        return;
+    }
+    case SK::Case: {
+        auto& cs = stmt.as<slang::ast::CaseStatement>();
+        for (const auto& g : cs.items)
+            if (g.stmt)
+                scanClockedArrayWrites(*g.stmt, loopVars, inResetBranch);
+        if (cs.defaultCase)
+            scanClockedArrayWrites(*cs.defaultCase, loopVars, inResetBranch);
+        return;
+    }
+    case SK::Timed:
+        scanClockedArrayWrites(stmt.as<slang::ast::TimedStatement>().stmt, loopVars, inResetBranch);
+        return;
+    case SK::ForLoop: {
+        // Bring the loop's induction variables into scope for the
+        // body so arr[y][x] sweeps register-file writes are seen as
+        // full-extent. Remove them again on the way out.
+        auto& fl = stmt.as<slang::ast::ForLoopStatement>();
+        std::vector<const slang::ast::Symbol*> added;
+        for (const auto* lv : fl.loopVars) {
+            if (lv && loopVars.insert(lv).second)
+                added.push_back(lv);
+        }
+        scanClockedArrayWrites(fl.body, loopVars, inResetBranch);
+        for (const auto* lv : added)
+            loopVars.erase(lv);
+        return;
+    }
+    default:
+        return;
+    }
 }
 
 } // namespace connect

@@ -85,6 +85,27 @@ struct DeclarationCapture {
     slang::SourceLocation location;
 };
 
+// Synthesizability / latch-inference risk recorded by ConnectionExtractor
+// during the procedural-block walk and consumed by SynthesizabilityChecker.
+// Each entry is one diagnosable construct (e.g. a register-file misused as
+// a variable-address memory that DC will infer as a latch). The extractor
+// stays rule-light: it captures the offending signal + location + a ready
+// message; the checker just maps these into Issues.
+struct SynthRisk {
+    enum class Kind {
+        RegfileLatchInference, // clocked variable-index partial array write + combinational read -> DC latch (ELAB-978)
+        IncompleteCombAssignment // always_comb signal assigned on some-but-not-all branches and read -> latch
+    };
+    Kind kind;
+    std::string scopePath; // enclosing module hierarchical path
+    std::string signal;    // offending array / signal leaf name
+    std::string detail;    // human-readable message body
+    slang::SourceLocation location;
+    uint32_t lineNumber = 0;
+    uint32_t columnNumber = 0;
+    bool isError = false; // true -> ERROR severity (process-fatal); false -> WARN
+};
+
 struct ConnectionGraph {
     std::vector<Connection> connections;
     std::vector<PortInfo> allPorts;
@@ -95,6 +116,7 @@ struct ConnectionGraph {
     std::vector<StyleObservation> styleObservations;
     std::vector<DeclarationCapture> parameters;
     std::vector<DeclarationCapture> typedefs;
+    std::vector<SynthRisk> synthRisks;
 };
 
 } // namespace connect
